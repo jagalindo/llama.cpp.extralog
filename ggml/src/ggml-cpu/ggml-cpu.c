@@ -12819,6 +12819,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_ADD:
             {
+                BILLAUD_weight_repartition(tensor);
                 ggml_compute_forward_add(params, tensor);
             } break;
         case GGML_OP_ADD1:
@@ -12835,6 +12836,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL:
             {
+                BILLAUD_weight_repartition(tensor);
                 ggml_compute_forward_mul(params, tensor);
             } break;
         case GGML_OP_DIV:
@@ -12915,6 +12917,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
+                if(toggle()){
+                    BILLAUD_weight_repartition(tensor);
+                }
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:

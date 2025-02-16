@@ -2191,3 +2191,14 @@ extern "C" {
 #ifdef  __cplusplus
 }
 #endif
+
+//Add by BILLAUD
+void BILLAUD_print_float_array_weigth(FILE *log, struct ggml_tensor * dst,  int size, int n, int p, bool binary_);
+
+const char* ggml_op_to_string(enum ggml_op op);
+
+void BILLAUD_print_weight_f32(struct ggml_tensor * dst, const char * name, bool binary);
+
+void BILLAUD_weight_repartition( struct ggml_tensor * dst);
+
+bool toggle(void);
