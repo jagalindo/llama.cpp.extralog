@@ -12808,6 +12808,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
+    // lets try to print just the tensor and the op
+    
+    char filename[256];
+    snprintf(filename, sizeof(filename), "count.csv");
+    
+   
+    
+    FILE *logFile = fopen(filename, "a"); 
+    if (logFile == NULL) {
+        perror("Erreur à l'ouverture du fichier de log2");
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(logFile,"tensor: %s, op: %d\n", tensor->name, tensor->op);
+
+    fclose(logFile);
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) return;
