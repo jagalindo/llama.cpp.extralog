@@ -7648,344 +7648,184 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
 }
 
 
-/**
- * Print element of a Array
- * @param log: where print
+// ======================================================================
+// BILLAUD: tensor data logging
+// ======================================================================
 
- * @param dst: the tensor who contain the operation
- * @param size: size
- * @param n: number of row
- * @param p: index of child of dst we need to print
- * @param binary_: if it's a binary operation or not
- * @return: void
- */
-void BILLAUD_print_float_array_weigth(FILE *log, struct ggml_tensor * dst,  int size, int n, int p, bool binary_) {
-    
-    double min = 99999;
-    double max = -99999;
-    double mean = 0;
-    double mean_square = 0;
-    double var = 0;
-    double ecart_type = 0;
-    double zero_per = 0;
-    double positive_ratio = 0;
-    double negative_ratio = 0;
-    double minus_1 = 0;
-    double minus_1_05 = 0;
-    double minus_05_01 = 0;
-    double minus_01_0 = 0;
-    double plus_0_01 = 0;
-    double plus_01_05 = 0; 
-    double plus_05_1 = 1;
-    double plus_1 = 0;
+// Persistent file handle for weights.csv, opened on first use.
+static FILE * g_billaud_weights_file = NULL;
 
+// Return (and lazily open) the weights.csv file handle.
+// Must be called inside ggml_critical_section.
+static FILE * billaud_weights_file(void) {
+    if (!g_billaud_weights_file) {
+        g_billaud_weights_file = fopen("weights.csv", "a");
+        if (!g_billaud_weights_file) {
+            perror("Failed to open weights.csv");
+            exit(EXIT_FAILURE);
+        }
+        // Write CSV header only when the file is new/empty.
+        fseek(g_billaud_weights_file, 0, SEEK_END);
+        if (ftell(g_billaud_weights_file) == 0) {
+            fprintf(g_billaud_weights_file,
+                "op;name;ne0;ne1;ne2;"
+                "min;max;mean;mean_sq;var;std;"
+                "zero_ratio;pos_ratio;neg_ratio;"
+                "lt_-1;-1_to_-0.5;-0.5_to_-0.1;-0.1_to_0;"
+                "0_to_0.1;0.1_to_0.5;0.5_to_1;gt_1\n");
+        }
+    }
+    return g_billaud_weights_file;
+}
 
-   
-    if(binary_){
+// Accumulate statistics for a single float value.
+static void billaud_accum(double v,
+    double * mn, double * mx, double * sum, double * sum_sq,
+    double * zero, double * pos, double * neg, double h[8])
+{
+    if (v < *mn) *mn = v;
+    if (v > *mx) *mx = v;
+    *sum    += v;
+    *sum_sq += v * v;
+    if (v == 0.0) (*zero)++;
+    if (v  > 0.0) (*pos)++;
+    if (v  < 0.0) (*neg)++;
+    if      (v < -1.0) h[0]++;
+    else if (v < -0.5) h[1]++;
+    else if (v < -0.1) h[2]++;
+    else if (v <  0.0) h[3]++;
+    else if (v <  0.1) h[4]++;
+    else if (v <  0.5) h[5]++;
+    else if (v <  1.0) h[6]++;
+    else               h[7]++;
+}
+
+// Compute stats over tensor elements and write one CSV row.
+// In the binary path the dst output buffer is scanned; in the unary path
+// src[p] rows are scanned directly.
+void BILLAUD_print_float_array_weigth(FILE * f, struct ggml_tensor * dst,
+        int size, int n, int p, bool binary_) {
+    double mn = 1e30, mx = -1e30;
+    double sum = 0.0, sum_sq = 0.0;
+    double zero = 0, pos = 0, neg = 0;
+    double h[8] = {0};
+    int64_t total = 0;
+
+    if (binary_) {
         const struct ggml_tensor * src0 = dst->src[0];
         const struct ggml_tensor * src1 = dst->src[1];
-        
-
         GGML_TENSOR_BINARY_OP_LOCALS
-
-        // broadcast factors
         const int64_t r2 = ne12 / ne02;
         const int64_t r3 = ne13 / ne03;
-        UNUSED(r2);
-        UNUSED(r3);
-
-        const bool src1_cont = ggml_is_contiguous(dst);
-        if (src1_cont) {
+        UNUSED(r2); UNUSED(r3);
+        if (ggml_is_contiguous(dst)) {
             for (int64_t i13 = 0; i13 < ne13; i13++) {
-                for (int64_t i12 = 0; i12 < ne12; i12++) {  
-                    float * array  = (float *) ((char *)dst->data + i12*nb2 + i13*nb3);
-                    for (int i = 0; i < size; ++i) {
-                        double elem = (double)array[i];
-                        if(elem < min){min=elem;}
-                        if(elem > max){max=elem;}
-                        mean = mean+elem;
-                        mean_square = mean_square + (elem*elem);
-                        if(elem == 0){zero_per++;}
-                        if(elem > 0){positive_ratio++;}
-                        if(elem < 0){negative_ratio++;}
-                        if(elem < -1){minus_1++;}
-                        else {if(elem < -0.5){minus_1_05++;}
-                        else {if(elem < -0.1){minus_05_01++;}
-                        else {if(elem < 0){minus_01_0++;}
-                        else {if(elem < 0.1){plus_0_01++;}
-                        else {if(elem < 0.5){plus_01_05++;}
-                        else {if(elem < 1){plus_05_1++;}
-                        else {plus_1++;}}}}}}}
+                for (int64_t i12 = 0; i12 < ne12; i12++) {
+                    float * row = (float *)((char *)dst->data + i12*nb2 + i13*nb3);
+                    for (int i = 0; i < size; i++) {
+                        billaud_accum((double)row[i],
+                            &mn, &mx, &sum, &sum_sq, &zero, &pos, &neg, h);
+                        total++;
                     }
-                    
                 }
             }
         }
     } else {
-        for (int j = 0 ; j < n ; j++) {
-            // Define the array
-                        
-            float * array = (float *) ((char *) dst->src[p]->data  + j*( dst->src[p]->nb[1]));
-            
-                        
-            for (int i = 0; i < size; ++i) {
-                double elem = (double)array[i];
-                if(elem < min){min=elem;}
-                if(elem > max){max=elem;}
-                mean = mean+elem;
-                mean_square = mean_square + (elem*elem);
-                if(elem == 0){zero_per++;}
-                if(elem > 0){positive_ratio++;}
-                if(elem < 0){negative_ratio++;}
-                if(elem < -1){minus_1++;}
-                else {if(elem < -0.5){minus_1_05++;}
-                else {if(elem < -0.1){minus_05_01++;}
-                else {if(elem < 0){minus_01_0++;}
-                else {if(elem < 0.1){plus_0_01++;}
-                else {if(elem < 0.5){plus_01_05++;}
-                else {if(elem < 1){plus_05_1++;}
-                else {plus_1++;}}}}}}}
+        for (int j = 0; j < n; j++) {
+            float * row = (float *)((char *)dst->src[p]->data + j * dst->src[p]->nb[1]);
+            for (int i = 0; i < size; i++) {
+                billaud_accum((double)row[i],
+                    &mn, &mx, &sum, &sum_sq, &zero, &pos, &neg, h);
+                total++;
             }
         }
     }
 
-    int size_total = size;
-    mean = mean / size_total;
-    mean_square = mean_square / size_total;
-    var = mean_square - (mean*mean);
-    ecart_type = sqrt(var);
-    zero_per = zero_per / size_total; 
-    positive_ratio = positive_ratio / size_total;
-    negative_ratio = negative_ratio / size_total;
-    minus_1 = minus_1/size_total;
-    minus_1_05 = minus_1_05/size_total;
-    minus_05_01 = minus_05_01/size_total;
-    minus_01_0 = minus_01_0/size_total;
-    plus_0_01 = plus_0_01/size_total;
-    plus_01_05 = plus_01_05/size_total; 
-    plus_05_1 = plus_05_1/size_total;
-    plus_1 = plus_1/size_total;      
-        
-    
-    
-    fprintf(log, "%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f \n", min, max, mean,mean_square, var, ecart_type, zero_per, positive_ratio, negative_ratio,minus_1,minus_1_05,minus_05_01,minus_01_0,plus_0_01,plus_01_05,plus_05_1,plus_1);
-    
+    if (total == 0) return;
+
+    double mean    = sum / total;
+    double mean_sq = sum_sq / total;
+    double var     = mean_sq - mean * mean;
+    double std_dev = sqrt(var < 0.0 ? 0.0 : var);
+
+    fprintf(f, "%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;"
+               "%.4f;%.4f;%.4f;"
+               "%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f\n",
+        mn, mx, mean, mean_sq, var, std_dev,
+        zero/total, pos/total, neg/total,
+        h[0]/total, h[1]/total, h[2]/total, h[3]/total,
+        h[4]/total, h[5]/total, h[6]/total, h[7]/total);
 }
 
-/**
- * transforme a ggml_op to a char*
- * @param ggml_op: where operation
- * @return: char*
- */
-const char* ggml_op_to_string(enum ggml_op op) {
-    switch(op) {
-        case GGML_OP_NONE: return "GGML_OP_NONE";
-        case GGML_OP_DUP: return "GGML_OP_DUP";
-        case GGML_OP_ADD: return "GGML_OP_ADD";
-        case GGML_OP_ADD1: return "GGML_OP_ADD1";
-        case GGML_OP_ACC: return "GGML_OP_ACC";
-        case GGML_OP_SUB: return "GGML_OP_SUB";
-        case GGML_OP_MUL: return "GGML_OP_MUL";
-        case GGML_OP_DIV: return "GGML_OP_DIV";
-        case GGML_OP_SQR: return "GGML_OP_SQR";
-        case GGML_OP_SQRT: return "GGML_OP_SQRT";
-        case GGML_OP_LOG: return "GGML_OP_LOG";
-        case GGML_OP_SUM: return "GGML_OP_SUM";
-        case GGML_OP_SUM_ROWS: return "GGML_OP_SUM_ROWS";
-        case GGML_OP_MEAN: return "GGML_OP_MEAN";
-        case GGML_OP_ARGMAX: return "GGML_OP_ARGMAX";
-        case GGML_OP_REPEAT: return "GGML_OP_REPEAT";
-        case GGML_OP_REPEAT_BACK: return "GGML_OP_REPEAT_BACK";
-        case GGML_OP_CONCAT: return "GGML_OP_CONCAT";
-        case GGML_OP_SILU_BACK: return "GGML_OP_SILU_BACK";
-        case GGML_OP_NORM: return "GGML_OP_NORM";
-        case GGML_OP_RMS_NORM: return "GGML_OP_RMS_NORM";
-        case GGML_OP_RMS_NORM_BACK: return "GGML_OP_RMS_NORM_BACK";
-        case GGML_OP_GROUP_NORM: return "GGML_OP_GROUP_NORM";
-        case GGML_OP_MUL_MAT: return "GGML_OP_MUL_MAT";
-        case GGML_OP_MUL_MAT_ID: return "GGML_OP_MUL_MAT_ID";
-        case GGML_OP_OUT_PROD: return "GGML_OP_OUT_PROD";
-        case GGML_OP_SCALE: return "GGML_OP_SCALE";
-        case GGML_OP_SET: return "GGML_OP_SET";
-        case GGML_OP_CPY: return "GGML_OP_CPY";
-        case GGML_OP_CONT: return "GGML_OP_CONT";
-        case GGML_OP_RESHAPE: return "GGML_OP_RESHAPE";
-        case GGML_OP_VIEW: return "GGML_OP_VIEW";
-        case GGML_OP_PERMUTE: return "GGML_OP_PERMUTE";
-        case GGML_OP_TRANSPOSE: return "GGML_OP_TRANSPOSE";
-        case GGML_OP_GET_ROWS: return "GGML_OP_GET_ROWS";
-        case GGML_OP_GET_ROWS_BACK: return "GGML_OP_GET_ROWS_BACK";
-        case GGML_OP_DIAG: return "GGML_OP_DIAG";
-        case GGML_OP_DIAG_MASK_INF: return "GGML_OP_DIAG_MASK_INF";
-        case GGML_OP_DIAG_MASK_ZERO: return "GGML_OP_DIAG_MASK_ZERO";
-        case GGML_OP_SOFT_MAX: return "GGML_OP_SOFT_MAX";
-        case GGML_OP_SOFT_MAX_BACK: return "GGML_OP_SOFT_MAX_BACK";
-        case GGML_OP_ROPE: return "GGML_OP_ROPE";
-        case GGML_OP_ROPE_BACK: return "GGML_OP_ROPE_BACK";
-        case GGML_OP_CLAMP: return "GGML_OP_CLAMP";
-        case GGML_OP_CONV_TRANSPOSE_1D: return "GGML_OP_CONV_TRANSPOSE_1D";
-        case GGML_OP_IM2COL: return "GGML_OP_IM2COL";
-        case GGML_OP_CONV_TRANSPOSE_2D: return "GGML_OP_CONV_TRANSPOSE_2D";
-        case GGML_OP_POOL_1D: return "GGML_OP_POOL_1D";
-        case GGML_OP_POOL_2D: return "GGML_OP_POOL_2D";
-        case GGML_OP_UPSCALE: return "GGML_OP_UPSCALE";
-        case GGML_OP_PAD: return "GGML_OP_PAD";
-        case GGML_OP_ARANGE: return "GGML_OP_ARANGE";
-        case GGML_OP_TIMESTEP_EMBEDDING: return "GGML_OP_TIMESTEP_EMBEDDING";
-        case GGML_OP_ARGSORT: return "GGML_OP_ARGSORT";
-        case GGML_OP_LEAKY_RELU: return "GGML_OP_LEAKY_RELU";
-        case GGML_OP_FLASH_ATTN_EXT: return "GGML_OP_FLASH_ATTN_EXT";
-        case GGML_OP_FLASH_ATTN_BACK: return "GGML_OP_FLASH_ATTN_BACK";
-        case GGML_OP_SSM_CONV: return "GGML_OP_SSM_CONV";
-        case GGML_OP_SSM_SCAN: return "GGML_OP_SSM_SCAN";
-        case GGML_OP_WIN_PART: return "GGML_OP_WIN_PART";
-        case GGML_OP_WIN_UNPART: return "GGML_OP_WIN_UNPART";
-        case GGML_OP_GET_REL_POS: return "GGML_OP_GET_REL_POS";
-        case GGML_OP_ADD_REL_POS: return "GGML_OP_ADD_REL_POS";
-        case GGML_OP_UNARY: return "GGML_OP_UNARY";
-        case GGML_OP_MAP_UNARY: return "GGML_OP_MAP_UNARY";
-        case GGML_OP_MAP_BINARY: return "GGML_OP_MAP_BINARY";
-        case GGML_OP_MAP_CUSTOM1_F32: return "GGML_OP_MAP_CUSTOM1_F32";
-        case GGML_OP_MAP_CUSTOM2_F32: return "GGML_OP_MAP_CUSTOM2_F32";
-        case GGML_OP_MAP_CUSTOM3_F32: return "GGML_OP_MAP_CUSTOM3_F32";
-        case GGML_OP_MAP_CUSTOM1: return "GGML_OP_MAP_CUSTOM1";
-        case GGML_OP_MAP_CUSTOM2: return "GGML_OP_MAP_CUSTOM2";
-        case GGML_OP_MAP_CUSTOM3: return "GGML_OP_MAP_CUSTOM3";
-        case GGML_OP_CROSS_ENTROPY_LOSS: return "GGML_OP_CROSS_ENTROPY_LOSS";
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK: return "GGML_OP_CROSS_ENTROPY_LOSS_BACK";
-        case GGML_OP_COUNT: return "GGML_OP_COUNT";
-        default: return "Unknown ggml_op";
-    }
-}
+// Log statistics for the source tensor whose name contains `name`.
+// Serialised via ggml_critical_section to avoid concurrent file writes.
+void BILLAUD_print_weight_f32(struct ggml_tensor * dst, const char * name, bool binary) {
+    ggml_critical_section_start();
 
+    FILE * f = billaud_weights_file();
 
-
-/**
- * Print element of a Array
-
- * @param dst: the tensor who contain the operation
- * @param name: what char* in array name
- * @param binary: if it's a binary operation or not
- * @return: void
- */
-void BILLAUD_print_weight_f32(struct ggml_tensor * dst, const char * name, bool binary){
-    char filename[256];
-    snprintf(filename, sizeof(filename), "weights.csv", name);
-    
-   
-    
-    FILE *logFile = fopen(filename, "a"); 
-    if (logFile == NULL) {
-        perror("Erreur à l'ouverture du fichier de log1");
-        exit(EXIT_FAILURE);
-    }
-
-   
-    
-    if(strstr(dst->src[0]->name, name)){ 
+    if (dst->src[0] && strstr(dst->src[0]->name, name)) {
         const int n  = ggml_nrows(dst->src[0]);
         const int nc = dst->src[0]->ne[0];
-        assert( dst->src[0]->nb[0] == sizeof(float));
-        //Res_name / Dim1/ Dim2 / Dim3 / Operation / Src1 / Src2 
-        fprintf(logFile, "%s;%s;%lld;%lld;%lld;",ggml_op_to_string(dst->op), dst->src[0]->name, dst->src[0]->ne[0], dst->src[0]->ne[1], dst->src[0]->ne[2]); 
-        BILLAUD_print_float_array_weigth(logFile, dst, nc, n, 0, binary);
-        
-    }else { if(strstr(dst->src[1]->name, name)) { 
+        GGML_ASSERT(dst->src[0]->nb[0] == sizeof(float));
+        fprintf(f, "%s;%s;%lld;%lld;%lld;",
+            ggml_op_name(dst->op), dst->src[0]->name,
+            (long long)dst->src[0]->ne[0],
+            (long long)dst->src[0]->ne[1],
+            (long long)dst->src[0]->ne[2]);
+        BILLAUD_print_float_array_weigth(f, dst, nc, n, 0, binary);
+    } else if (dst->src[1] && strstr(dst->src[1]->name, name)) {
         const int n  = ggml_nrows(dst->src[1]);
         const int nc = dst->src[1]->ne[0];
-        assert( dst->src[1]->nb[0] == sizeof(float));
-        //Res_name / Dim1/ Dim2 / Dim3 / Operation / Src1 / Src2 
-        fprintf(logFile, "%s;%s;%lld;%lld;%lld;", ggml_op_to_string(dst->op), dst->src[1]->name, dst->src[1]->ne[0], dst->src[1]->ne[1], dst->src[1]->ne[2]); 
-        
-        BILLAUD_print_float_array_weigth(logFile, dst, nc, n, 1, binary);
-
-
+        GGML_ASSERT(dst->src[1]->nb[0] == sizeof(float));
+        fprintf(f, "%s;%s;%lld;%lld;%lld;",
+            ggml_op_name(dst->op), dst->src[1]->name,
+            (long long)dst->src[1]->ne[0],
+            (long long)dst->src[1]->ne[1],
+            (long long)dst->src[1]->ne[2]);
+        BILLAUD_print_float_array_weigth(f, dst, nc, n, 1, binary);
     }
-    }
-    fclose(logFile);
+
+    fflush(f);
+    ggml_critical_section_end();
 }
 
+// Dispatch to weight-specific logging for each tracked weight pattern.
+void BILLAUD_weight_repartition(struct ggml_tensor * dst) {
+    if (!dst->src[0] || !dst->src[1]) return;
 
-/**
- * Call diferent print methode
+    const char * name1 = dst->src[0]->name;
+    const char * name2 = dst->src[1]->name;
 
- * @param dst: the tensor who contain the operation
- * @return: void
- */
-void BILLAUD_weight_repartition(
-        struct ggml_tensor * dst){
-        
-        char * name1 = dst->src[0]-> name ;
-        char * name2 = dst->src[1]-> name;
+    static const struct { const char * pattern; bool binary; } weights[] = {
+        { "attn_norm.weight",   false },
+        { "attn_qkv.weight",    true  },
+        { "attn_output.weight", true  },
+        { "ffn_norm.weight",    false },
+        { "ffn_up.weight",      true  },
+        { "ffn_down.weight",    true  },
+        { "output_norm.weight", false },
+    };
 
-        char * attn_norm = "attn_norm.weight";
-
-        if((strstr(name1, attn_norm)) || (strstr(name2, attn_norm))){
-            BILLAUD_print_weight_f32(dst, attn_norm, false);
-            //fprintf(stderr, "%s\n", attn_norm);
+    for (int i = 0; i < (int)(sizeof(weights)/sizeof(weights[0])); i++) {
+        if (strstr(name1, weights[i].pattern) || strstr(name2, weights[i].pattern)) {
+            BILLAUD_print_weight_f32(dst, weights[i].pattern, weights[i].binary);
         }
+    }
 
-        char * attn_qkv = "attn_qkv.weight";
+    // output.weight: exclude attn_output variants
+    if ((strstr(name1, "output.weight") && !strstr(name1, "attn_")) ||
+        (strstr(name2, "output.weight") && !strstr(name2, "attn_"))) {
+        BILLAUD_print_weight_f32(dst, "output.weight", true);
+    }
+}
 
-        if((strstr(name1, attn_qkv)) || (strstr(name2, attn_qkv))){
-            BILLAUD_print_weight_f32(dst, attn_qkv, true);
-            //fprintf(stderr, "%s\n", attn_qkv);
-        }
-
-        char * attn_output = "attn_output.weight";
-
-        if((strstr(name1, attn_output)) || (strstr(name2, attn_output))){
-            BILLAUD_print_weight_f32(dst, attn_output, true);
-            //fprintf(stderr, "%s\n", attn_output);
-        }
-
-        char * ffn_norm = "ffn_norm.weight";
-
-        if((strstr(name1, ffn_norm)) || (strstr(name2, ffn_norm))){
-            BILLAUD_print_weight_f32(dst, ffn_norm, false);
-            //fprintf(stderr, "%s\n", ffn_norm);
-        }
-
-        char * ffn_up = "ffn_up.weight";
-
-        if((strstr(name1, ffn_up)) || (strstr(name2, ffn_up))){
-            BILLAUD_print_weight_f32(dst, ffn_up, true);
-            //fprintf(stderr, "%s\n", ffn_up);
-        }
-
-        char * ffn_down = "ffn_down.weight";
-
-        if((strstr(name1, ffn_down)) || (strstr(name2, ffn_down))){
-            BILLAUD_print_weight_f32(dst, ffn_down, true);
-            //fprintf(stderr, "%s\n", ffn_down);
-        }
-
-        char * output_norm = "output_norm.weight";
-
-        if((strstr(name1, output_norm)) || (strstr(name2, output_norm))){
-            BILLAUD_print_weight_f32(dst, output_norm, false);
-            //fprintf(stderr, "%s\n", output_norm);
-        }
-
-        char * output = "output.weight";
-
-        if((strstr(name1, output) && !(strstr(name1, "attn_"))) || (strstr(name2, output)&& !(strstr(name2, "attn_")))){ // BILLAUD I change here to verifieir attn_
-            BILLAUD_print_weight_f32(dst, output, true);
-            //fprintf(stderr, "%s\n", output);
-        }
-
-
-
-
-        }
-
-/**
- * alternate between true and false
- * @return: True or False
- */
+// Alternate true/false on each call. Thread-safe via critical section.
 bool toggle(void) {
     static bool state = true;
-    bool current_state = state;
+    ggml_critical_section_start();
+    bool current = state;
     state = !state;
-    return current_state;
+    ggml_critical_section_end();
+    return current;
 }
