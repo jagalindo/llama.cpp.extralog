@@ -1,0 +1,15 @@
+# Domain-specific prompts — edit this file with prompts from your target domain.
+# One prompt per line. Lines starting with # are ignored.
+# These prompts drive which weights get activated during domain inference.
+# Use 20–100 diverse prompts for a stable importance estimate.
+
+The transformer architecture uses self-attention to model long-range dependencies.
+Explain how gradient descent minimizes the cross-entropy loss in a language model.
+What is the difference between BERT and GPT in terms of training objectives?
+Describe the role of layer normalization in deep neural networks.
+How does rotary position embedding differ from learned position embeddings?
+The attention mechanism computes a weighted sum of value vectors using query-key dot products.
+Explain the function of the feed-forward sublayer in a transformer block.
+What are the advantages of grouped-query attention over multi-head attention?
+How does weight quantization affect model accuracy in large language models?
+Describe the GPTQ quantization algorithm and its use of second-order information.
