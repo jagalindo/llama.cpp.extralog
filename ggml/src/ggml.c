@@ -7652,6 +7652,178 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
 // BILLAUD: tensor data logging
 // ======================================================================
 
+// ---------------------------------------------------------------------------
+// Activation logging for MUL_MAT — used to drive quantization decisions.
+//
+// Two output files:
+//   activations.csv   – one row per MUL_MAT call per tracked weight.
+//                       Always written.  Tells you the overall "temperature"
+//                       (mean activation magnitude) of each weight across time.
+//
+//   act_channels.csv  – one row per input channel per MUL_MAT call.
+//                       Written only for the first BILLAUD_CHANNEL_SAMPLES
+//                       calls per weight.  This is the data you actually need
+//                       to decide which channels / k-quant blocks to preserve.
+//
+// Volume estimate for a 7B model, 10 domain prompts of 128 tokens:
+//   activations.csv  : ~250K rows  (~15 MB)
+//   act_channels.csv : ~42M rows   (~2.5 GB) — reduce BILLAUD_CHANNEL_SAMPLES
+//                      if disk space is a concern.
+// ---------------------------------------------------------------------------
+
+#define BILLAUD_MAX_TRACKED      512   // max unique weight tensors tracked
+#define BILLAUD_MAX_CHANNELS   16384   // max input channels per weight (covers 70B+)
+#define BILLAUD_CHANNEL_SAMPLES    5   // per-channel CSV written for first N calls/weight
+
+// Per-weight call counter table (protected by ggml_critical_section).
+typedef struct { char name[128]; int count; } BillaudTracker;
+static BillaudTracker g_billaud_trackers[BILLAUD_MAX_TRACKED];
+static int            g_billaud_n_trackers = 0;
+
+// Returns the current call index for `name` and increments it.
+// Registers the name on first call.  Returns -1 if the table is full.
+// Must be called inside ggml_critical_section.
+static int billaud_call_idx(const char * name) {
+    for (int i = 0; i < g_billaud_n_trackers; i++) {
+        if (strcmp(g_billaud_trackers[i].name, name) == 0)
+            return g_billaud_trackers[i].count++;
+    }
+    if (g_billaud_n_trackers >= BILLAUD_MAX_TRACKED) return -1;
+    BillaudTracker * t = &g_billaud_trackers[g_billaud_n_trackers++];
+    strncpy(t->name, name, sizeof(t->name) - 1);
+    t->name[sizeof(t->name) - 1] = '\0';
+    t->count = 1;
+    return 0;
+}
+
+static FILE * g_billaud_act_file  = NULL;
+static FILE * g_billaud_chan_file = NULL;
+
+// Open a CSV file in append mode and write the header iff it is empty.
+// Must be called inside ggml_critical_section.
+static FILE * billaud_open_csv(const char * path, const char * header) {
+    FILE * f = fopen(path, "a");
+    if (!f) { perror(path); exit(EXIT_FAILURE); }
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fputs(header, f);
+    return f;
+}
+
+// Scratch buffer for per-channel means, shared across calls (protected by
+// ggml_critical_section — only one call executes at a time).
+static float s_billaud_ch_mean[BILLAUD_MAX_CHANNELS];
+
+// Weight name patterns whose activations we track (same set as weight logging).
+static const char * const BILLAUD_ACT_PATTERNS[] = {
+    "attn_norm.weight", "attn_qkv.weight", "attn_output.weight",
+    "ffn_norm.weight",  "ffn_up.weight",   "ffn_down.weight",
+    "output_norm.weight", NULL
+};
+
+// Log per-channel activation statistics for a MUL_MAT operation.
+//
+// src[0] = weight matrix  (may be quantized)
+// src[1] = input activation (F32, shape [n_in, n_tokens, ...])
+// dst    = output           (F32)
+//
+// Activation layout for a contiguous F32 tensor in ggml:
+//   data[t * n_in + ch]  for token t, input channel ch.
+void BILLAUD_log_mulmat_activations(struct ggml_tensor * dst) {
+    if (!dst->src[0] || !dst->src[1]) return;
+
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * act    = dst->src[1];
+
+    if (weight->name[0] == '\0') return;
+    // Activations in llama.cpp are always F32 at the point of MUL_MAT execution.
+    if (act->type != GGML_TYPE_F32) return;
+    if (!ggml_is_contiguous(act))   return;
+
+    // Match tracked patterns.
+    bool matched = false;
+    for (int i = 0; BILLAUD_ACT_PATTERNS[i]; i++) {
+        if (strstr(weight->name, BILLAUD_ACT_PATTERNS[i])) { matched = true; break; }
+    }
+    // output.weight but NOT attn_output.weight
+    if (!matched &&  strstr(weight->name, "output.weight")
+                 && !strstr(weight->name, "attn_"))
+        matched = true;
+    if (!matched) return;
+
+    const int n_in     = (int)act->ne[0];
+    const int n_tokens = (int)act->ne[1];
+    if (n_in <= 0 || n_in > BILLAUD_MAX_CHANNELS || n_tokens <= 0) return;
+
+    ggml_critical_section_start();
+
+    if (!g_billaud_act_file)
+        g_billaud_act_file = billaud_open_csv("activations.csv",
+            "weight_name,call_id,n_in,n_tokens,"
+            "mean_abs,max_abs,std_abs,outlier_frac\n");
+
+    int call_id = billaud_call_idx(weight->name);
+    bool sample_channels = (call_id >= 0 && call_id < BILLAUD_CHANNEL_SAMPLES);
+
+    if (sample_channels && !g_billaud_chan_file)
+        g_billaud_chan_file = billaud_open_csv("act_channels.csv",
+            "weight_name,call_id,channel_idx,mean_abs,max_abs,std_abs\n");
+
+    // ---- single pass over [n_tokens][n_in] data ---------------------------
+    const float * data = (const float *)act->data;
+
+    double global_sum_mean    = 0.0;
+    double global_sum_sq_mean = 0.0;
+    double global_max_abs     = 0.0;
+
+    for (int ch = 0; ch < n_in; ch++) {
+        double ch_sum = 0.0, ch_max = 0.0, ch_sq = 0.0;
+        for (int t = 0; t < n_tokens; t++) {
+            double v = (double)data[t * n_in + ch];
+            double a = v < 0.0 ? -v : v;
+            ch_sum += a;
+            ch_sq  += v * v;
+            if (a > ch_max) ch_max = a;
+        }
+        double ch_mean = ch_sum / n_tokens;
+        double ch_var  = ch_sq / n_tokens - ch_mean * ch_mean;
+        double ch_std  = sqrt(ch_var < 0.0 ? 0.0 : ch_var);
+
+        s_billaud_ch_mean[ch] = (float)ch_mean;
+
+        global_sum_mean    += ch_mean;
+        global_sum_sq_mean += ch_mean * ch_mean;
+        if (ch_max > global_max_abs) global_max_abs = ch_max;
+
+        if (sample_channels)
+            fprintf(g_billaud_chan_file, "%s,%d,%d,%.6f,%.6f,%.6f\n",
+                weight->name, call_id, ch, ch_mean, ch_max, ch_std);
+    }
+
+    // ---- global aggregate stats -------------------------------------------
+    double global_mean = global_sum_mean / n_in;
+    double global_var  = global_sum_sq_mean / n_in - global_mean * global_mean;
+    double global_std  = sqrt(global_var < 0.0 ? 0.0 : global_var);
+    double thresh      = global_mean + 3.0 * global_std;  // outlier threshold
+
+    int outliers = 0;
+    for (int ch = 0; ch < n_in; ch++)
+        if ((double)s_billaud_ch_mean[ch] > thresh) outliers++;
+
+    fprintf(g_billaud_act_file, "%s,%d,%d,%d,%.6f,%.6f,%.6f,%.4f\n",
+        weight->name, call_id, n_in, n_tokens,
+        global_mean, global_max_abs, global_std,
+        (double)outliers / n_in);
+
+    if (sample_channels) fflush(g_billaud_chan_file);
+    fflush(g_billaud_act_file);
+
+    ggml_critical_section_end();
+}
+
+// ---------------------------------------------------------------------------
+// Weight distribution logging (existing)
+// ---------------------------------------------------------------------------
+
 // Persistent file handle for weights.csv, opened on first use.
 static FILE * g_billaud_weights_file = NULL;
 

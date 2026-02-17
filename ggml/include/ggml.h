@@ -2760,4 +2760,5 @@ extern "C" {
 void BILLAUD_print_float_array_weigth(FILE * log, struct ggml_tensor * dst, int size, int n, int p, bool binary_);
 void BILLAUD_print_weight_f32(struct ggml_tensor * dst, const char * name, bool binary);
 void BILLAUD_weight_repartition(struct ggml_tensor * dst);
+void BILLAUD_log_mulmat_activations(struct ggml_tensor * dst);
 bool toggle(void);

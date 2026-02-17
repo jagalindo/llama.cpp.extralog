@@ -1823,8 +1823,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                if(toggle()){
-                    BILLAUD_weight_repartition(tensor);
+                if (params->ith == 0) {
+                    // Log input activation stats before the computation runs.
+                    // Only thread 0 logs to avoid duplicate/concurrent writes.
+                    BILLAUD_log_mulmat_activations(tensor);
+                    if (toggle()) {
+                        BILLAUD_weight_repartition(tensor);
+                    }
                 }
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
