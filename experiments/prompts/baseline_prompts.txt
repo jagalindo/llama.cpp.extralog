@@ -1,0 +1,13 @@
+# Baseline (general) prompts for comparison against domain prompts.
+# These help identify channels that are always active vs. domain-specific ones.
+
+What is the capital of France?
+Write a short poem about autumn leaves.
+Give me a simple recipe for chocolate cake.
+Explain how a bicycle works.
+What are the rules of chess?
+Tell me a joke about a programmer.
+What is the weather like in summer?
+Describe the plot of Romeo and Juliet.
+How do you change a car tire?
+What is photosynthesis?

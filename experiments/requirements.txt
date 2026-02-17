@@ -1,0 +1,4 @@
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+pyarrow>=12.0   # optional but strongly recommended for large files

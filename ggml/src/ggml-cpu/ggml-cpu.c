@@ -12808,22 +12808,23 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
-    // lets try to print just the tensor and the op
-    
-    char filename[256];
-    snprintf(filename, sizeof(filename), "count.csv");
-    
-   
-    
-    FILE *logFile = fopen(filename, "a"); 
-    if (logFile == NULL) {
-        perror("Erreur à l'ouverture du fichier de log2");
-        exit(EXIT_FAILURE);
+    // Log each tensor and its op to count.csv (thread 0 only to avoid duplicates).
+    if (params->ith == 0) {
+        static FILE * g_count_file = NULL;
+        if (!g_count_file) {
+            g_count_file = fopen("count.csv", "a");
+            if (!g_count_file) {
+                perror("Failed to open count.csv");
+                exit(EXIT_FAILURE);
+            }
+            fseek(g_count_file, 0, SEEK_END);
+            if (ftell(g_count_file) == 0) {
+                fprintf(g_count_file, "tensor,op\n");
+            }
+        }
+        fprintf(g_count_file, "%s,%d\n", tensor->name, tensor->op);
+        fflush(g_count_file);
     }
-
-    fprintf(logFile,"tensor: %s, op: %d\n", tensor->name, tensor->op);
-
-    fclose(logFile);
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) return;
@@ -12933,8 +12934,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                if(toggle()){
-                    BILLAUD_weight_repartition(tensor);
+                if (params->ith == 0) {
+                    BILLAUD_log_mulmat_activations(tensor);
+                    if (toggle()) {
+                        BILLAUD_weight_repartition(tensor);
+                    }
                 }
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
